@@ -1,3 +1,5 @@
+import numpy as np
+
 from constants import ATTACKS
 
 attack_name_prefix = '{targeted_prefix}_{attack_name}_model-{model}'
@@ -27,6 +29,16 @@ attack_name_to_params = {
         'learning_rate': 0.01,
         'batch_size': 50,
         'initial_const': 0.1
+    },
+    ATTACKS.MIM: {
+        'eps': list(np.arange(0.0, 0.31, 0.01)),
+        'eps_iter': 0.06,
+        'nb_iter': 10  # should be 10
+    },
+    ATTACKS.MIM + '_quick': {
+        'eps': 0.2,
+        'eps_iter': 0.06,
+        'nb_iter': 10  # should be 10
     }
 }
 
