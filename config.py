@@ -20,6 +20,13 @@ attack_name_to_params = {
         'learning_rate': 0.01,
         'batch_size': 10,
         'initial_const': [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+    },
+    ATTACKS.CARLINI_WAGNER + '_quick': {
+        'binary_search_steps': 5,  # 5 is better
+        'max_iterations': 1000,  # 1000 is best
+        'learning_rate': 0.01,
+        'batch_size': 50,
+        'initial_const': 0.1
     }
 }
 
