@@ -2,6 +2,8 @@ import numpy as np
 
 from constants import ATTACKS
 
+import cleverhans.attacks as attacks
+
 attack_name_prefix = '{targeted_prefix}_{attack_name}_model-{model}'
 
 attack_to_prefix_template = {
@@ -15,9 +17,23 @@ attack_to_prefix_template = {
     ATTACKS.CARLINI_WAGNER: '_binary_search_steps-{binary_search_steps}_learning_rate-{learning_rate}_initial_const-{initial_const}_max_iterations-{max_iterations}'
 }
 
+attack_name_to_class = {
+    ATTACKS.CARLINI_WAGNER: attacks.CarliniWagnerL2,
+    ATTACKS.FGSM: attacks.FastGradientMethod,
+    ATTACKS.MIM: attacks.MomentumIterativeMethod,
+    ATTACKS.BIM: attacks.BasicIterativeMethod,
+    ATTACKS.SALIENCY_MAP: attacks.SaliencyMapMethod,
+    ATTACKS.VIRTUAL_ATTACK: attacks.VirtualAdversarialMethod,
+    ATTACKS.ELASTIC_NET: attacks.ElasticNetMethod,
+    ATTACKS.DEEP_FOOL: attacks.DeepFool,
+    ATTACKS.LBFGS: attacks.LBFGS,
+    ATTACKS.MADRY: attacks.MadryEtAl,
+    ATTACKS.FAST_FEATURES: attacks.FastFeatureAdversaries
+}
+
 attack_name_to_params = {
     ATTACKS.CARLINI_WAGNER: {
-        'binary_search_steps': [1, 5, 10, 20, 25], # 5 is better
+        'binary_search_steps': [1, 5], # 5 is better
         'max_iterations': 1000, # 1000 is best
         'learning_rate': 0.01,
         'batch_size': 10,
@@ -26,9 +42,9 @@ attack_name_to_params = {
     ATTACKS.CARLINI_WAGNER + '_quick': {
         'binary_search_steps': 5,  # 5 is better
         'max_iterations': 1000,  # 1000 is best
-        'learning_rate': 0.01,
+        'learning_rate': 0.1,
         'batch_size': 50,
-        'initial_const': 0.1
+        'initial_const': 100000.0
     },
     ATTACKS.MIM: {
         'eps': list(np.arange(0.0, 0.31, 0.01)),
@@ -36,8 +52,8 @@ attack_name_to_params = {
         'nb_iter': 10  # should be 10
     },
     ATTACKS.MIM + '_quick': {
-        'eps': 0.2,
-        'eps_iter': 0.06,
+        'eps': 30.0,
+        'eps_iter': 1.0,
         'nb_iter': 10  # should be 10
     }
 }
