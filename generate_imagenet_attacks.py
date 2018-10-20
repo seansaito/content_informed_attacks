@@ -13,6 +13,7 @@ import csv
 import itertools
 import logging
 import os
+import pprint
 
 import numpy as np
 import tensorflow as tf
@@ -25,7 +26,7 @@ from tensorflow.contrib import slim
 from tensorflow.contrib.slim.nets import inception
 
 from config import attack_name_to_configurable_params, attack_name_to_params, \
-    attack_to_prefix_template, attack_name_prefix
+    attack_to_prefix_template, attack_name_prefix, attack_name_to_class
 from constants import ATTACKS
 
 logger = logging.getLogger(__name__)
@@ -116,8 +117,8 @@ class InceptionModel(Model):
         return self(x_input)
 
 
-def _top_1_accuracy(logits, labels):
-    return tf.reduce_mean(tf.cast(tf.nn.in_top_k(logits, labels, 1), tf.float32))
+def _top_k_accuracy(logits, labels, k=1):
+    return tf.cast(tf.nn.in_top_k(logits, labels, k), tf.float32)
 
 
 def expand_param_dict(params, configurable_params):
@@ -156,6 +157,7 @@ def get_attack_images_filename_prefix(attack_name, params, model, targeted_prefi
 
     return attack_images_file_name_prefix
 
+
 def test_inference():
     """Check model is accurate on unperturbed images."""
     input_dir = FLAGS.input_image_dir
@@ -173,7 +175,7 @@ def test_inference():
         y_label = tf.placeholder(tf.int32, shape=(num_images,))
         model = InceptionModel(num_classes)
         logits = model.get_logits(x_input)
-        acc = _top_1_accuracy(logits, y_label)
+        acc = _top_k_accuracy(logits, y_label)
 
         # Run computation
         saver = tf.train.Saver(slim.get_model_variables())
@@ -185,8 +187,93 @@ def test_inference():
 
         with tf.train.MonitoredSession(session_creator=session_creator) as sess:
             acc_val = sess.run(acc, feed_dict={x_input: images, y_label: np.argmax(labels, axis=1)})
-            tf.logging.info('Accuracy: %s', acc_val)
+            acc_val = np.mean(acc_val)
+            tf.logging.info('Accuracy on clean data: %s', acc_val)
             assert acc_val > 0.8
+
+
+def attack_with_mim_aux(images, labels, target_classes, params, save_dir):
+    tf.reset_default_graph()
+
+    num_images = images.shape[0]
+    batch_size = params.get('batch_size', 50)
+    batch_shape = (None, 299, 299, 3)
+    num_classes = 1001
+
+    logger.info('Running attack with parameters:')
+    pprint.pprint(params)
+
+    # Get save path
+    adv_imgs_save_path = get_attack_images_filename_prefix(
+        attack_name=ATTACKS.MIM,
+        params=params,
+        model='inception',
+        targeted_prefix='targeted'
+    )
+    adv_imgs_save_path = os.path.join(save_dir, adv_imgs_save_path)
+
+    # Run inference
+    graph = tf.Graph()
+    with graph.as_default():
+        sess = tf.Session(graph=graph)
+        # Prepare graph
+        x_input = tf.placeholder(tf.float32, shape=(batch_size,) + batch_shape[1:])
+        y_label = tf.placeholder(tf.int32, shape=(batch_size, num_classes))
+        y_target = tf.placeholder(tf.int32, shape=(batch_size, num_classes))
+        model = InceptionModel(num_classes)
+
+        attack = attack_name_to_class[ATTACKS.MIM](model=model, sess=sess)
+        x_adv = attack.generate(x_input, y_target=y_target, **params)
+
+        logits = model.get_logits(x_adv)
+        acc = _top_k_accuracy(logits, tf.argmax(y_label, axis=1), k=1)
+        success_rate = _top_k_accuracy(logits, tf.argmax(y_target, axis=1), k=1)
+
+        # Run computation
+        saver = tf.train.Saver(slim.get_model_variables())
+        saver.restore(sess, save_path=FLAGS.checkpoint_path)
+
+        list_adv_images = []
+
+        if num_images % batch_size == 0:
+            num_batches = int(num_images / batch_size)
+        else:
+            num_batches = int(num_images / batch_size + 1)
+
+        acc_store = []
+        succ_store = []
+        for i in tqdm.tqdm(range(num_batches)):
+            feed_dict_i = {x_input: images[i * batch_size:(i + 1) * batch_size],
+                           y_target: target_classes[i * batch_size:(i + 1) * batch_size],
+                           y_label: labels[i * batch_size:(i + 1) * batch_size]}
+            acc_batch, suc_batch, adv_img = sess.run([acc, success_rate, x_adv],
+                                                     feed_dict=feed_dict_i)
+            list_adv_images.append(adv_img)
+            acc_store.extend(acc_batch)
+            succ_store.extend(suc_batch)
+
+        adv_images = np.concatenate((list_adv_images))
+        np.save(adv_imgs_save_path, adv_images)
+
+        logger.info('Accuracy is: {:.4f}'.format(np.mean(acc_store)))
+        logger.info('Success Rate is: {:.4f}'.format(np.mean(succ_store)))
+
+
+def attack_with_mim():
+    tf.logging.set_verbosity(tf.logging.INFO)
+    input_dir = FLAGS.input_image_dir
+    metadata_file_path = FLAGS.metadata_file_path
+    num_images = len(os.listdir(input_dir))
+    num_classes = 1001
+    batch_shape = (num_images, 299, 299, 3)
+    images, labels, target_classes = load_images(input_dir, metadata_file_path, batch_shape,
+                                                 num_classes)
+    save_dir = 'saves'
+    os.makedirs(save_dir, exist_ok=True)
+
+    attack_with_mim_aux(images, labels, target_classes,
+                        attack_name_to_params[ATTACKS.MIM + '_quick'], save_dir=save_dir)
+
 
 def iterate_through_cwl2_attacks():
     tf.logging.set_verbosity(tf.logging.INFO)
@@ -235,15 +322,16 @@ def iterate_through_cwl2_attacks():
             cwl2 = True
             if cwl2:
                 attack = CarliniWagnerL2(model=model, sess=sess)
-                x_adv = attack.generate(x_input, y=y_target, **params)
+                x_adv = attack.generate(x_input, y_target=y_target, **params)
             else:
                 attack = SPSA(model=model)
-                x_adv = attack.generate(x_input, y=y_label, epsilon=4./255, num_steps=30,
-                  early_stop_loss_threshold=-1., batch_size=32, spsa_iters=16,
-                  is_debug=True)
+                x_adv = attack.generate(x_input, y_target=y_label, epsilon=4. / 255, num_steps=30,
+                                        early_stop_loss_threshold=-1., batch_size=32, spsa_iters=16,
+                                        is_debug=True)
 
-            # logits = model.get_logits(x_adv)
-            # acc = _top_1_accuracy(logits, tf.argmax(y_label, axis=1))
+            logits = model.get_logits(x_input)
+            acc = _top_k_accuracy(logits, tf.argmax(y_label, axis=1), k=1)
+            success_rate = _top_k_accuracy(logits, tf.argmax(y_target, axis=1), k=1)
 
             # Run computation
             saver = tf.train.Saver(slim.get_model_variables())
@@ -257,59 +345,27 @@ def iterate_through_cwl2_attacks():
                 num_batches = int(num_images / batch_size + 1)
 
             for i in tqdm.tqdm(range(num_batches)):
-                feed_dict_i = {x_input: images[i*batch_size:(i+1)*batch_size],
-                               y_target: target_classes[i*batch_size:(i+1)*batch_size]}
+                feed_dict_i = {x_input: images[i * batch_size:(i + 1) * batch_size],
+                               y_target: target_classes[i * batch_size:(i + 1) * batch_size]}
                 adv_img = sess.run(x_adv, feed_dict=feed_dict_i)
                 list_adv_images.append(adv_img)
 
             adv_images = np.concatenate((list_adv_images))
             np.save(adv_imgs_save_path, adv_images)
 
-        # tf.reset_default_graph()
-        # with tf.Graph().as_default():
-        #     # Prepare graph
-        #     x_input = tf.placeholder(tf.float32, shape=(1,) + batch_shape[1:])
-        #     y_label = tf.placeholder(tf.int32, shape=(1, num_classes))
-        #     # y_target = tf.placeholder(tf.int32, shape=(1,))
-        #
-        #     # logits = model.get_logits(x_adv)
-        #     # acc = _top_1_accuracy(logits, y_label)
-        #     model = InceptionModel(num_classes)
-        #     _ = model.get_logits(x_input)
-        #
-        #     attack = CarliniWagnerL2(model)
-        #     x_adv = attack.generate(x=x_input, y=y_label, **params)
-        #     logger.info('x_adv is: {}'.format(x_adv))
-        #
-        #     # Run computation
-        #     saver = tf.train.Saver(slim.get_model_variables())
-        #     session_creator = tf.train.ChiefSessionCreator(
-        #         scaffold=tf.train.Scaffold(saver=saver),
-        #         checkpoint_filename_with_path=FLAGS.checkpoint_path,
-        #         master=FLAGS.master)
-        #
-        #     with tf.train.MonitoredSession(session_creator=session_creator) as sess:
-        #
-        #         list_adv_images = []
-        #
-        #         num_correct = 0.
-        #         for i in xrange(num_images):
-        #             image = images[i]
-        #             feed_dict_i = {x_input: np.expand_dims(image, axis=0),
-        #                            y_label: np.expand_dims(np.argmax(labels[i]), axis=0)}
-        #             adv_image = sess.run([x_adv], feed_dict=feed_dict_i)
-        #             list_adv_images.append(adv_image)
-        #             # num_correct += acc_val
-        #
-        #         tf.logging.info('Parameters of attack: {}'.format(params))
-        #         # tf.logging.info('Success Rate: %s', num_correct / float(num_images))
-        #
-        #         # Save the images
-        #         adv_images = np.concatenate((list_adv_images))
-        #
-        #         logger.info('Saving to: {}'.format(adv_imgs_save_path))
-        #
-        #     # np.save(adv_imgs_save_path, adv_images)
+            acc_store = []
+            succ_store = []
+            for i in tqdm.tqdm(range(num_batches)):
+                feed_dict_i = {x_input: adv_images[i * batch_size:(i + 1) * batch_size],
+                               y_target: target_classes[i * batch_size:(i + 1) * batch_size],
+                               y_label: labels[i * batch_size:(i + 1) * batch_size]}
+                succ_batch, acc_batch = sess.run([success_rate, acc],
+                                                 feed_dict=feed_dict_i)
+                acc_store.extend(acc_batch)
+                succ_store.extend(succ_batch)
+
+            logger.info('Accuracy is: {:.4f}'.format(np.mean(acc_store)))
+            logger.info('Success Rate is: {:.4f}'.format(np.mean(succ_store)))
 
 
 if __name__ == '__main__':
@@ -317,3 +373,4 @@ if __name__ == '__main__':
                         format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s')
     # test_inference()
     iterate_through_cwl2_attacks()
+    # attack_with_mim()
