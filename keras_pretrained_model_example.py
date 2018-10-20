@@ -6,7 +6,7 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-import copy
+import argparse
 import csv
 import logging
 import os
@@ -17,15 +17,15 @@ import keras
 import numpy as np
 import tensorflow as tf
 import tqdm
-from cleverhans.attacks import CarliniWagnerL2
 from cleverhans.model import Model, NoSuchLayerError
 from cleverhans.utils_keras import KerasModelWrapper
 from keras.preprocessing import image
 
-from config import attack_name_to_params
+from config import attack_name_to_params, attack_name_to_class
 from constants import ATTACKS
 
 logger = logging.getLogger(__name__)
+
 
 # Define VGG16 model that is cleverhans-compliant
 class VGG16(Model):
@@ -66,9 +66,11 @@ class VGG16(Model):
         else:
             return self.keras_model.predict(x)
 
+
 def load_image(image_path):
     img = image.load_img(image_path, target_size=(224, 224))
     return image.img_to_array(img)
+
 
 def load_nips_adv_comp_images(input_dir, metadata_file_path, num_classes):
     """
@@ -101,10 +103,11 @@ def load_nips_adv_comp_images(input_dir, metadata_file_path, num_classes):
         image = load_image(filepath)
         images[idx, :, :, :] = image
         # Make sure to subtract 1 from the labels
-        labels[idx, int(row[row_idx_true_label])-1] = 1
-        target_labels[idx, int(row[row_idx_target_label])-1] = 1
+        labels[idx, int(row[row_idx_true_label]) - 1] = 1
+        target_labels[idx, int(row[row_idx_target_label]) - 1] = 1
 
     return images, labels, target_labels
+
 
 def convert_range_to_cwl2_range(x, old_max, old_min, new_max, new_min):
     old_range = (old_max - old_min)
@@ -112,14 +115,14 @@ def convert_range_to_cwl2_range(x, old_max, old_min, new_max, new_min):
     new_x = (((x - old_min) * new_range) / old_range) + new_min
     return new_x
 
+
 # Define attack
-def attack_model():
+def attack_model(attack_name):
     """
     Attack the given model using CWL2
 
     Args:
-        model (VGG16): Model that combines a keras.applications model and cleverhans'
-        KerasModelWrapper
+        attack_name (str): Name of attack
 
     """
     # WARNING the the NIPS17 adv competition data has class range of 1 to 1000
@@ -132,23 +135,14 @@ def attack_model():
     images, labels, target_labels = load_nips_adv_comp_images(input_dir=input_image_dir,
                                                               metadata_file_path=metadata_file_path,
                                                               num_classes=num_classes)
+    clean_labels_flattened = np.argmax(labels, axis=1)
+
     old_max = np.max(images)
     old_min = np.min(images)
     logger.info('Max pixel val of clean images: {}'.format(old_max))
     logger.info('Min pixel val of clean images: {}'.format(old_min))
-    logger.info('Images look like:')
-    print(images[0])
+    logger.info('Images shape: {}'.format(images.shape))
     num_images = images.shape[0]
-    # images_copy = copy.copy(images)
-    images_for_cwl2 = convert_range_to_cwl2_range(
-                    x=images,
-                    old_max=old_max,
-                    old_min=old_min,
-                    new_max=1.0,
-                    new_min=0.0)
-    logger.info('Images for CWL2 look like:')
-    print(images_for_cwl2[0])
-    clean_labels_flattened = np.argmax(labels, axis=1)
 
     # Create TF session and set as Keras backend session
     logger.info('Number of images: {}'.format(num_images))
@@ -160,15 +154,17 @@ def attack_model():
 
         # Shape of ImageNet data for the keras models is (224, 224, 3)
         x_ph = tf.placeholder(tf.float32, shape=(None, 224, 224, 3), name='x_input')
-        y_label = tf.placeholder(tf.int32, shape=(None, num_classes), name='y_label')
         y_target = tf.placeholder(tf.int32, shape=(None, num_classes), name='y_target')
 
-        attack = CarliniWagnerL2(model=model, sess=sess)
-        params = attack_name_to_params[ATTACKS.CARLINI_WAGNER + '_quick']
-        logger.info('Running Carlini Wagner L2 attacks using params:')
+        attack = attack_name_to_class[attack_name](model=model, sess=sess)
+        params = attack_name_to_params[attack_name + '_quick']
+        logger.info('Running {} attack using params:'.format(attack_name))
+        if attack_name == ATTACKS.CARLINI_WAGNER:
+            params['clip_min'] = old_min
+            params['clip_max'] = old_max
         pprint.pprint(params)
-        batch_size = params['batch_size']
-        x_adv = attack.generate(x_ph, y=y_target, **params)
+        batch_size = params.get('batch_size', 20)
+        x_adv = attack.generate(x_ph, y_target=y_target, **params)
 
         list_adv_images = []
 
@@ -177,12 +173,19 @@ def attack_model():
         else:
             num_batches = int(images.shape[0] / batch_size + 1)
 
-        logger.info('Generating attacks for {} batches'.format(num_batches))
+        logger.info('Generating attacks for {} batches (batch size: {})'.format(
+            num_batches, batch_size))
         clean_predictions = []
         for i in tqdm.tqdm(range(num_batches)):
+            # if attack_name == ATTACKS.CARLINI_WAGNER:
+            #     feed_dict_i = {
+            #         x_ph: images_for_cwl2[i * batch_size:(i + 1) * batch_size],
+            #         y_target: target_labels[i * batch_size:(i + 1) * batch_size]}
+            # else:
             feed_dict_i = {
-                x_ph: images_for_cwl2[i * batch_size:(i + 1) * batch_size],
+                x_ph: images[i * batch_size:(i + 1) * batch_size],
                 y_target: target_labels[i * batch_size:(i + 1) * batch_size]}
+
             clean_prediction_batch = model.predict(
                 images[i * batch_size:(i + 1) * batch_size], preprocess=True)
             clean_predictions.extend(clean_prediction_batch)
@@ -199,34 +202,12 @@ def attack_model():
 
         logger.info('Getting predictions on adversarial image data')
         predictions = []
-        adv_images_old_range = convert_range_to_cwl2_range(
-            x=adv_images,
-            old_max=1.0,
-            old_min=0.0,
-            new_max=old_max,
-            new_min=old_min
-        )
 
         # Run model predictions on adv_images
         for i in tqdm.tqdm(range(num_batches)):
-            adv_image_batch = adv_images_old_range[i*batch_size:(i+1)*batch_size]
+            adv_image_batch = adv_images[i * batch_size:(i + 1) * batch_size]
             predict_batch = model.predict(adv_image_batch, preprocess=True)
             predictions.extend(predict_batch)
-
-    # logger.info('Clean images before preprocessing:')
-    # print(images[0])
-    # print(images_copy[0])
-    #
-    # logger.info('Clean images after preprocessing looks like:')
-    # print(model.preprocess_input(images[0]))
-    # print(model.preprocess_input(images_copy[0]))
-    #
-    # logger.info('Adversarial images look like:')
-    # print(adv_images[0])
-    #
-    # logger.info('Adversarial images after shifting range look like:')
-    # print(convert_range_to_cwl2_range(
-    #     x=adv_images[0], old_max=1.0, old_min=0.0, new_max=old_max, new_min=old_min))
 
     predictions = np.argmax(np.array(predictions), axis=1)
     logger.info('Shape of predictions: {}'.format(predictions.shape))
@@ -243,4 +224,12 @@ def attack_model():
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s')
-    attack_model()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--attack', type=str, required=True, help='Name of attack')
+
+    args = parser.parse_args()
+    args = vars(args)
+
+    attack = args['attack']
+
+    attack_model(attack)
